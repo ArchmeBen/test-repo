@@ -1,5 +1,10 @@
-// Mock taskboard: seed data plus localStorage persistence, no backend.
+// Mock taskboard. Uses taskboard-api when it's reachable, otherwise falls back
+// to seed data plus localStorage persistence.
 const STORAGE_KEY = "taskboard.tasks";
+const API_TIMEOUT_MS = 2000;
+
+// Override with ?api=http://host:port, e.g. index.html?api=http://localhost:4000
+const API_BASE = (new URLSearchParams(location.search).get("api") || "http://localhost:3000").replace(/\/$/, "");
 
 const SEED_TASKS = [
   { id: 1, title: "Set up project repo", priority: "high", done: true, assignee: "Alex" },
@@ -9,10 +14,25 @@ const SEED_TASKS = [
   { id: 5, title: "Schedule user interviews", priority: "medium", done: false, assignee: "Alex" },
 ];
 
-let tasks = load();
+let tasks = [];
 let filter = "all";
+let online = false;
 
-function load() {
+async function api(path, { method = "GET", body } = {}) {
+  const res = await fetch(API_BASE + path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body && JSON.stringify(body),
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({}));
+    throw new Error(error || `Request failed (${res.status})`);
+  }
+  return res.status === 204 ? undefined : res.json();
+}
+
+function loadLocal() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
     if (Array.isArray(saved)) return saved;
@@ -20,10 +40,42 @@ function load() {
   return structuredClone(SEED_TASKS);
 }
 
-function save() {
+function saveLocal() {
+  if (online) return;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
   } catch {}
+}
+
+function setOnline(value, message) {
+  online = value;
+  const badge = document.getElementById("status");
+  badge.textContent = online ? "api" : "local";
+  badge.classList.toggle("online", online);
+  badge.title = online ? `Connected to ${API_BASE}` : `Saving in this browser (${API_BASE} unreachable)`;
+  showNotice(message);
+}
+
+function showNotice(message) {
+  const notice = document.getElementById("notice");
+  notice.textContent = message || "";
+  notice.hidden = !message;
+}
+
+// Runs a change against the API, or applies it locally when offline.
+// If the API call fails, switch to local mode and apply the change there.
+async function mutate(remote, local) {
+  if (online) {
+    try {
+      await remote();
+      return update();
+    } catch (err) {
+      tasks = loadLocal();
+      setOnline(false, `Lost connection to the API (${err.message}). Switched to local mode.`);
+    }
+  }
+  local();
+  update();
 }
 
 function renderStats() {
@@ -58,8 +110,11 @@ function renderTasks() {
     checkbox.type = "checkbox";
     checkbox.checked = task.done;
     checkbox.addEventListener("change", () => {
-      task.done = checkbox.checked;
-      update();
+      const done = checkbox.checked;
+      mutate(
+        async () => Object.assign(task, await api(`/tasks/${task.id}`, { method: "PATCH", body: { done } })),
+        () => { tasks.find((t) => t.id === task.id).done = done; }
+      );
     });
 
     const title = document.createElement("span");
@@ -75,8 +130,8 @@ function renderTasks() {
     del.title = "Delete";
     del.textContent = "✕";
     del.addEventListener("click", () => {
-      tasks = tasks.filter((t) => t.id !== task.id);
-      update();
+      const removeIt = () => { tasks = tasks.filter((t) => t.id !== task.id); };
+      mutate(async () => { await api(`/tasks/${task.id}`, { method: "DELETE" }); removeIt(); }, removeIt);
     });
 
     li.append(checkbox, title, meta, del);
@@ -85,7 +140,7 @@ function renderTasks() {
 }
 
 function update() {
-  save();
+  saveLocal();
   renderStats();
   renderTasks();
 }
@@ -95,15 +150,12 @@ document.getElementById("new-task").addEventListener("submit", (e) => {
   const input = document.getElementById("title");
   const title = input.value.trim();
   if (!title) return;
-  tasks.unshift({
-    id: Date.now(),
-    title,
-    priority: document.getElementById("priority").value,
-    done: false,
-    assignee: "You",
-  });
+  const priority = document.getElementById("priority").value;
   input.value = "";
-  update();
+  mutate(
+    async () => tasks.unshift(await api("/tasks", { method: "POST", body: { title, priority } })),
+    () => tasks.unshift({ id: Date.now(), title, priority, done: false, assignee: "You" })
+  );
 });
 
 document.getElementById("filters").addEventListener("click", (e) => {
@@ -116,4 +168,15 @@ document.getElementById("filters").addEventListener("click", (e) => {
   renderTasks();
 });
 
-update();
+async function init() {
+  try {
+    tasks = await api("/tasks");
+    setOnline(true);
+  } catch {
+    tasks = loadLocal();
+    setOnline(false);
+  }
+  update();
+}
+
+init();
